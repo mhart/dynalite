@@ -130,13 +130,25 @@ exports.types = {
       },
     },
   },
+  StreamSpecification: {
+    type: 'ValueStruct<StreamSpecification>',
+    children: {
+      StreamEnabled: {
+        type: 'Boolean',
+      },
+      StreamViewType: {
+        type: 'String',
+        enum: ['KEYS_ONLY', 'NEW_IMAGE', 'OLD_IMAGE', 'NEW_AND_OLD_IMAGES'],
+      },
+    },
+  },
 }
 
 exports.custom = function(data) {
 
-  if (!data.ProvisionedThroughput && !data.UpdateStreamEnabled &&
+  if (!data.ProvisionedThroughput && !data.StreamSpecification && !data.UpdateStreamEnabled &&
       (!data.GlobalSecondaryIndexUpdates || !data.GlobalSecondaryIndexUpdates.length) && !data.SSESpecification) {
-    return 'At least one of ProvisionedThroughput, UpdateStreamEnabled, GlobalSecondaryIndexUpdates or SSESpecification is required'
+    return 'At least one of ProvisionedThroughput, BillingMode, UpdateStreamEnabled, GlobalSecondaryIndexUpdates or SSESpecification is required'
   }
 
   if (data.ProvisionedThroughput) {

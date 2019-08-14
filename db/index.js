@@ -3,11 +3,13 @@ var crypto = require('crypto'),
     async = require('async'),
     Lazy = require('lazy'),
     levelup = require('levelup'),
+    kinesaliteDb = require('kinesalite/db'),
     memdown = require('memdown'),
     sub = require('subleveldown'),
     lock = require('lock'),
     Big = require('big.js'),
-    once = require('once')
+    once = require('once'),
+    utils = require('../utils')
 
 exports.MAX_SIZE = 409600 // TODO: get rid of this? or leave for backwards compat?
 exports.create = create
@@ -49,13 +51,21 @@ function create(options) {
 
   var db = levelup(options.path ? require('leveldown')(options.path) : memdown()),
       tableDb = sub(db, 'table', {valueEncoding: 'json'}),
-      subDbs = Object.create(null)
+      subDbs = Object.create(null),
+      kinesaliteOptions = {},
+      kinesaliteStore
+
+  if (options.path) {
+    kinesaliteOptions.path = options.path + '/kinesalite'
+  }
+
+  var kinesaliteStore = kinesaliteDb.create(kinesaliteOptions)
 
   tableDb.lock = lock.Lock()
 
   // XXX: Is there a better way to get this?
   tableDb.awsAccountId = (process.env.AWS_ACCOUNT_ID || '0000-0000-0000').replace(/[^\d]/g, '')
-  tableDb.awsRegion = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1'
+  tableDb.awsRegion = utils.awsRegion
 
   function getItemDb(name) {
     return getSubDb('item-' + name)
@@ -131,6 +141,7 @@ function create(options) {
     deleteIndexDb: deleteIndexDb,
     getTable: getTable,
     recreate: recreate,
+    kinesalite: kinesaliteStore,
   }
 }
 

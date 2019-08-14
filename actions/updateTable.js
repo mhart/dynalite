@@ -1,21 +1,87 @@
-var db = require('../db')
+var async = require('async'),
+    db = require('../db'),
+    createStream = require('kinesalite/actions/createStream'),
+    deleteStream = require('kinesalite/actions/deleteStream')
 
 module.exports = function updateTable(store, data, cb) {
 
   var key = data.TableName, tableDb = store.tableDb
 
-  tableDb.lock(key, function(release) {
-    cb = release(cb)
+  async.auto({
+    lock: function(callback) {
+      tableDb.lock(key, function(release) {
+        callback(null, release)
+      })
+    },
+    table: ['lock', function(results, callback) {
+      store.getTable(key, false, function(err, table) {
+        if (err) return callback(err)
 
-    store.getTable(key, false, function(err, table) {
-      if (err) return cb(err)
+        if (table.TableStatus == 'CREATING') {
+          err = new Error
+          err.statusCode = 400
+          err.body = {
+            __type: 'com.amazonaws.dynamodb.v20120810#ResourceInUseException',
+            message: 'Attempt to change a resource which is still in use: Table is being created: ' + key,
+          }
+          return callback(err)
+        }
 
-      var updates, i, update, dataThroughput, tableThroughput, readDiff, writeDiff
+        callback(null, table)
+      })
+    }],
+    streamUpdates: ['table', function(results, callback) {
+      var table = results.table
+
+      if (!data.StreamSpecification) {
+        return callback()
+      }
+
+      if (table.LatestStreamLabel && data.StreamSpecification.StreamEnabled === false) {
+        return deleteStream(store.kinesalite, { StreamName: data.TableName }, function(err) {
+          if (err) return callback(err)
+
+          callback(null, {
+            StreamSpecification: {},
+            LatestStreamLabel: null,
+            LatestStreamArn: null,
+          })
+        })
+      }
+
+      if (!table.LatestStreamLabel && data.StreamSpecification.StreamEnabled === true) {
+        return createStream(store.kinesalite, { StreamName: data.TableName, ShardCount: 1 }, function(err) {
+          if (err) return callback(err)
+
+          var latestStreamLabel = (new Date()).toISOString().replace('Z', '')
+          callback(null, {
+            StreamSpecification: data.StreamSpecification,
+            LatestStreamLabel: latestStreamLabel,
+            LatestStreamArn: 'arn:aws:dynamodb:' + tableDb.awsRegion + ':' + tableDb.awsAccountId + ':table/' + data.TableName + '/stream/' + latestStreamLabel,
+          })
+        })
+      }
+
+      // cf. https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateTable.html
+      // "You will receive a ResourceInUseException if you attempt to enable a
+      // stream on a table that already has a stream, or if you attempt to disable
+      // a stream on a table which does not have a stream."
+      var err = new Error
+      err.statusCode = 400
+      err.body = {
+        __type: 'com.amazonaws.dynamodb.v20120810#ResourceInUseException',
+        message: '',
+      }
+      callback(err)
+    }],
+    tableUpdates: ['table', function(results, callback) {
+      var table = results.table,
+          updates, i, update, dataThroughput, tableThroughput, readDiff, writeDiff
 
       try {
         updates = getThroughputUpdates(data, table)
       } catch (err) {
-        return cb(err)
+        return callback(err)
       }
 
       for (i = 0; i < updates.length; i++) {
@@ -26,7 +92,7 @@ module.exports = function updateTable(store, data, cb) {
         writeDiff = dataThroughput.WriteCapacityUnits - tableThroughput.WriteCapacityUnits
 
         if (!readDiff && !writeDiff)
-          return cb(db.validationError(
+          return callback(db.validationError(
             'The provisioned throughput for the table will not change. The requested value equals the current value. ' +
             'Current ReadCapacityUnits provisioned for the table: ' + tableThroughput.ReadCapacityUnits +
             '. Requested ReadCapacityUnits: ' + dataThroughput.ReadCapacityUnits + '. ' +
@@ -43,41 +109,61 @@ module.exports = function updateTable(store, data, cb) {
         update.writeDiff = writeDiff
       }
 
-      tableDb.put(key, table, function(err) {
-        if (err) return cb(err)
+      callback(null, updates)
+    }],
+    updateTable: ['tableUpdates', 'streamUpdates', function(results, callback) {
+      var table = results.table
 
-        setTimeout(function() {
+      if (results.streamUpdates) {
+        table.StreamSpecification = results.streamUpdates.StreamSpecification
+        table.LatestStreamLabel = results.streamUpdates.LatestStreamLabel
+        table.LatestStreamArn = results.streamUpdates.LatestStreamArn
+      }
 
-          // Shouldn't need to lock/fetch as nothing should have changed
-          updates.forEach(function(update) {
-            dataThroughput = update.dataThroughput
-            tableThroughput = update.tableThroughput
+      tableDb.put(key, table, callback)
+    }],
+    setActive: ['updateTable', function(results, callback) {
+      var table = results.table, updates = results.tableUpdates
 
-            update.setStatus('ACTIVE')
+      setTimeout(function() {
 
-            if (update.readDiff > 0 || update.writeDiff > 0) {
-              tableThroughput.LastIncreaseDateTime = Date.now() / 1000
-            } else if (update.readDiff < 0 || update.writeDiff < 0) {
-              tableThroughput.LastDecreaseDateTime = Date.now() / 1000
-              tableThroughput.NumberOfDecreasesToday++
-            }
+        // Shouldn't need to lock/fetch as nothing should have changed
+        updates.forEach(function(update) {
+          dataThroughput = update.dataThroughput
+          tableThroughput = update.tableThroughput
 
-            tableThroughput.ReadCapacityUnits = dataThroughput.ReadCapacityUnits
-            tableThroughput.WriteCapacityUnits = dataThroughput.WriteCapacityUnits
-          })
+          update.setStatus('ACTIVE')
 
-          tableDb.put(key, table, function(err) {
-            // eslint-disable-next-line no-console
-            if (err && !/Database is not open/.test(err)) console.error(err.stack || err)
-          })
+          if (update.readDiff > 0 || update.writeDiff > 0) {
+            tableThroughput.LastIncreaseDateTime = Date.now() / 1000
+          } else if (update.readDiff < 0 || update.writeDiff < 0) {
+            tableThroughput.LastDecreaseDateTime = Date.now() / 1000
+            tableThroughput.NumberOfDecreasesToday++
+          }
 
-        }, store.options.updateTableMs)
+          tableThroughput.ReadCapacityUnits = dataThroughput.ReadCapacityUnits
+          tableThroughput.WriteCapacityUnits = dataThroughput.WriteCapacityUnits
+        })
 
-        cb(null, {TableDescription: table})
-      })
-    })
+        tableDb.put(key, table, function(err) {
+          // eslint-disable-next-line no-console
+          if (err && !/Database is not open/.test(err)) console.error(err.stack || err)
+        })
+
+      }, store.options.updateTableMs)
+
+      callback()
+    }],
+  }, function(err, results) {
+    var release = results.lock
+    cb = release(cb)
+
+    if (err) {
+      return cb(err)
+    }
+
+    cb(null, {TableDescription: results.table})
   })
-
 }
 
 function getThroughputUpdates(data, table) {
